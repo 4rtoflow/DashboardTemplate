@@ -1,0 +1,191 @@
+import json
+import threading
+import unittest
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
+
+from worktree_board.judge import STATES, build_items, change_requests, failed_checks, judge, running_checks, settle
+from worktree_board.server import Board, Handler
+from worktree_board.sources import FetchError, parse_worktrees
+
+ME = "me"
+
+
+def pr(**kw) -> dict:
+    return {"number": 1, "title": "t", "url": "u", "headRefName": "feat", "headRefOid": "h1", "isDraft": False,
+            "mergeable": "MERGEABLE", "reviews": [], "reviewRequests": [], "statusCheckRollup": [], **kw}
+
+
+def run(name, conclusion, rid, status="COMPLETED", wf="CI"):
+    return {"__typename": "CheckRun", "name": name, "workflowName": wf, "status": status, "conclusion": conclusion,
+            "detailsUrl": f"https://github.com/o/r/actions/runs/{rid}/job/1"}
+
+
+def review(who, state, oid="h1", at="2026-01-01T00:00:00Z"):
+    return {"author": {"login": who}, "state": state, "commit": {"oid": oid}, "submittedAt": at}
+
+
+class JudgeOrder(unittest.TestCase):
+    def state(self, p, closed=None):
+        return judge(p, closed, ME)["state"]
+
+    def test_no_pr(self):
+        self.assertEqual(self.state(None), "自分の番")
+        self.assertEqual(self.state(None, {"number": 3, "state": "MERGED"}), "完了")
+
+    def test_conflict_beats_running_ci(self):
+        p = pr(mergeable="CONFLICTING", statusCheckRollup=[run("a", None, 1, "IN_PROGRESS")])
+        self.assertEqual(self.state(p), "自分の番")
+
+    def test_failed_ci_beats_running_ci(self):
+        p = pr(statusCheckRollup=[run("a", "FAILURE", 1), run("b", None, 2, "IN_PROGRESS")])
+        self.assertEqual(self.state(p), "自分の番")
+
+    def test_running_ci_is_github_wait(self):
+        self.assertEqual(self.state(pr(statusCheckRollup=[run("a", None, 1, "IN_PROGRESS")])), "GitHub 待ち")
+
+    def test_draft_waits_for_ci_first(self):
+        # CI が走っている間は、Draft でも GitHub 待ち（終わってから Ready にする）
+        p = pr(isDraft=True, statusCheckRollup=[run("a", None, 1, "QUEUED")])
+        self.assertEqual(self.state(p), "GitHub 待ち")
+        self.assertEqual(self.state(pr(isDraft=True)), "自分の番")
+
+    def test_changes_requested_on_head_is_mine(self):
+        self.assertEqual(self.state(pr(reviews=[review("a", "CHANGES_REQUESTED")])), "自分の番")
+
+    def test_push_after_change_request_waits_for_review(self):
+        self.assertEqual(self.state(pr(reviews=[review("a", "CHANGES_REQUESTED", oid="old")])), "レビュー待ち")
+
+    def test_approved_is_mine_unless_changes_requested(self):
+        self.assertEqual(judge(pr(reviews=[review("a", "APPROVED")]), None, ME)["reason"], "承認された")
+        both = pr(reviews=[review("a", "APPROVED"), review("b", "CHANGES_REQUESTED")])
+        self.assertEqual(judge(both, None, ME)["reason"], "b が変更を求めた")
+
+    def test_default_is_review_wait(self):
+        self.assertEqual(self.state(pr()), "レビュー待ち")
+
+
+class Checks(unittest.TestCase):
+    def test_rerun_that_passed_is_not_failed(self):
+        p = pr(statusCheckRollup=[run("a", "FAILURE", 1), run("a", "SUCCESS", 2)])
+        self.assertEqual(failed_checks(p), [])
+        # 実行順がどちらでも、最新の run（番号が大きいほう）で決まる
+        p = pr(statusCheckRollup=[run("a", "SUCCESS", 2), run("a", "FAILURE", 1)])
+        self.assertEqual(failed_checks(p), [])
+
+    def test_status_context(self):
+        p = pr(statusCheckRollup=[{"__typename": "StatusContext", "context": "ci/x", "state": "FAILURE"},
+                                  {"__typename": "StatusContext", "context": "ci/y", "state": "PENDING"}])
+        self.assertEqual(failed_checks(p), ["status/ci/x"])
+        self.assertEqual(running_checks(p), ["ci/y"])
+
+
+class Reviews(unittest.TestCase):
+    def test_latest_review_per_person_counts(self):
+        p = pr(reviews=[review("a", "CHANGES_REQUESTED", at="2026-01-01T00:00:00Z"),
+                        review("a", "APPROVED", at="2026-01-02T00:00:00Z")])
+        self.assertEqual(change_requests(p, ME), ([], []))
+
+    def test_own_and_comment_only_reviews_are_ignored(self):
+        p = pr(reviews=[review(ME, "CHANGES_REQUESTED"), review("a", "COMMENTED")])
+        self.assertEqual(change_requests(p, ME), ([], []))
+
+
+class Settle(unittest.TestCase):
+    def test_unknown_keeps_last_value_and_forgets_closed_prs(self):
+        memory: dict[int, str] = {}
+        settle([pr(mergeable="CONFLICTING")], memory)
+        self.assertEqual(settle([pr(mergeable="UNKNOWN")], memory)[0]["mergeable"], "CONFLICTING")
+        settle([], memory)
+        self.assertEqual(memory, {})
+
+
+class Items(unittest.TestCase):
+    def test_worktree_without_pr_and_pr_without_worktree(self):
+        items = build_items({"wip": "/w/wip", "feat": "/w/feat"}, [pr()], {}, ME)
+        by = {i["id"]: i for i in items}
+        self.assertEqual(by["wip"]["badges"], ["PR なし"])
+        self.assertEqual(by["feat"]["state"], "レビュー待ち")
+        items = build_items({}, [pr()], {}, ME)
+        self.assertEqual((items[0]["label"], items[0]["badges"]), ("PR #1", ["worktree なし"]))
+
+    def test_closed_pr_only_counts_without_open_pr(self):
+        closed = {"feat": {"number": 9, "state": "MERGED", "title": "old", "url": "u9"}}
+        self.assertEqual(build_items({"feat": "/w/feat"}, [], closed, ME)[0]["state"], "完了")
+        self.assertEqual(build_items({"feat": "/w/feat"}, [pr()], closed, ME)[0]["state"], "レビュー待ち")
+
+    def test_sorted_by_state_then_oldest(self):
+        prs = [pr(number=1, headRefName="a", updatedAt="2026-01-03T00:00:00Z"),
+               pr(number=2, headRefName="b", updatedAt="2026-01-01T00:00:00Z"),
+               pr(number=3, headRefName="c", isDraft=True, updatedAt="2026-01-02T00:00:00Z")]
+        items = build_items({}, prs, {}, ME)
+        self.assertEqual([i["pr"] for i in items], [3, 2, 1])
+        self.assertEqual(STATES.index(items[0]["state"]), 0)
+
+
+class Worktrees(unittest.TestCase):
+    def test_primary_first_and_detached_skipped(self):
+        text = ("worktree /r\nHEAD aaa\nbranch refs/heads/main\n\n"
+                "worktree /r-wt/x\nHEAD bbb\nbranch refs/heads/feat/x\n\n"
+                "worktree /r-wt/d\nHEAD ccc\ndetached\n")
+        self.assertEqual(parse_worktrees(text), ("/r", {"main": "/r", "feat/x": "/r-wt/x"}))
+
+
+class FakeSource:
+    repo = "o/r"
+
+    def __init__(self, got=None, error=None):
+        self.got, self.error = got, error
+
+    def fetch(self):
+        if self.error:
+            raise self.error
+        return self.got
+
+
+class BoardAndServer(unittest.TestCase):
+    def test_failed_fetch_keeps_previous_items(self):
+        src = FakeSource({"worktrees": {}, "prs": [pr()], "closed": {}, "me": ME})
+        board = Board(src)
+        board.tick()
+        self.assertEqual(len(board.view()["worktrees"]), 1)
+        src.error = FetchError("boom")
+        board.tick()
+        v = board.view()
+        self.assertEqual(len(v["worktrees"]), 1)
+        self.assertIn("boom", v["error"])
+
+    def serve(self):
+        board = Board(FakeSource({"worktrees": {}, "prs": [pr()], "closed": {}, "me": ME}))
+        board.tick()
+        Handler.board = board
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        return server.server_address[1]
+
+    def request(self, port, path, method="GET", headers=None):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method, headers=headers or {})
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, e.read()
+
+    def test_api_and_guards(self):
+        port = self.serve()
+        code, body = self.request(port, "/api/worktrees")
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(body)["worktrees"][0]["pr"], 1)
+        self.assertEqual(self.request(port, "/")[0], 200)
+        # ヘッダー無しの書き込みと、localhost 以外の名前の読み取りは断る
+        self.assertEqual(self.request(port, "/api/refresh", "POST")[0], 403)
+        self.assertEqual(self.request(port, "/api/refresh", "POST", {"X-Dashboard": "1"})[0], 202)
+        self.assertEqual(self.request(port, "/api/worktrees", headers={"Host": "evil.example"})[0], 403)
+
+
+if __name__ == "__main__":
+    unittest.main()

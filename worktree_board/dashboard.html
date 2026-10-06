@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>worktree board</title>
+<style>
+:root{
+  color-scheme:light dark;
+  --bg:light-dark(#fff,#1a1a1a);--col:light-dark(#f2f2f2,#000);--line:light-dark(#949494,#767676);
+  --text:light-dark(#1a1a1a,#e6e6e6);--sub:light-dark(#666,#999);
+  --accent:light-dark(#0017c1,#9db7f9);--accent-soft:light-dark(#e8f1fe,#00234b);
+  --danger:light-dark(#ce0000,#ff9696);--danger-soft:light-dark(#fdeeee,#620000);
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","Hiragino Sans","Noto Sans JP",sans-serif;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 var(--sans)}
+:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+header{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px;padding:12px 16px}
+h1{margin:0;font-size:20px;line-height:1.4}
+.repo{color:var(--sub)}
+.meta{margin-left:auto;display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px}
+.stamp{color:var(--sub)}
+.stamp.stale{color:var(--danger);font-weight:700}
+button.refresh{height:36px;padding:0 16px;border:1px solid var(--accent);border-radius:8px;background:var(--bg);color:var(--accent);font:inherit;font-weight:700;cursor:pointer}
+button.refresh:hover{background:var(--accent-soft)}
+button.refresh:disabled{border-color:var(--line);color:var(--sub);cursor:default;background:var(--col)}
+.alert{margin:0 16px 8px;padding:8px 12px;border:1px solid var(--danger);border-radius:8px;background:var(--danger-soft);color:var(--danger)}
+main{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr));gap:12px;padding:4px 16px 16px;align-items:start}
+.col{border-radius:12px;background:var(--col)}
+.col.mine{background:var(--accent-soft)}
+.col h2{display:flex;align-items:center;gap:8px;margin:0;padding:12px 12px 8px;font-size:16px}
+.count{min-width:24px;padding:0 8px;border:1px solid var(--line);border-radius:999px;background:var(--bg);font-size:14px;font-weight:400;line-height:22px;text-align:center}
+.list{display:flex;flex-direction:column;gap:8px;padding:0 8px 8px}
+.none{margin:0;padding:0 4px 4px;color:var(--sub)}
+.card{display:block;padding:8px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:inherit;text-decoration:none}
+a.card:hover{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
+.top{display:flex;align-items:baseline;gap:8px}
+.label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700}
+.age{flex:none;margin-left:auto;color:var(--sub);font-variant-numeric:tabular-nums}
+.title{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;overflow-wrap:anywhere}
+.reason{margin-top:4px;color:var(--sub)}
+.next{margin-top:2px;color:var(--accent)}
+.chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
+.chip{padding:0 6px;border:1px solid var(--line);border-radius:4px;font-size:12px;line-height:20px}
+</style>
+</head>
+<body>
+<header>
+  <h1>worktree board</h1><span id="repo" class="repo"></span>
+  <div class="meta"><span id="stamp" class="stamp"></span><button type="button" id="refresh" class="refresh">今すぐ見直す</button></div>
+</header>
+<p id="alert" class="alert" role="alert" hidden></p>
+<main id="board" aria-live="polite"></main>
+<script>
+(() => {
+  const CLS = {'自分の番': 'mine'};
+  const STALE_MIN = 5;  // 見直しは 1 分おき。これより古い更新の時刻は、見張りが止まっているとして赤く出す
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+  let data = null, refreshing = false;
+
+  function age(iso) {
+    const m = Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 60000));
+    return m < 60 ? `${m} 分前` : m < 1440 ? `${Math.floor(m / 60)} 時間前` : `${Math.floor(m / 1440)} 日前`;
+  }
+  const hhmm = iso => new Date(iso).toLocaleTimeString('ja-JP', {hour: '2-digit', minute: '2-digit'});
+
+  function card(i) {
+    const tag = i.url ? 'a' : 'div';
+    const link = i.url ? ` href="${esc(i.url)}" target="_blank" rel="noopener"` : '';
+    const chips = [...(i.pr && i.label !== `PR #${i.pr}` ? [`PR #${i.pr}`] : []), ...i.badges];
+    return `<${tag} class="card"${link}>
+      <span class="top"><span class="label">${esc(i.label)}</span>${i.updated_at ? `<span class="age" title="PR の最終更新">${age(i.updated_at)}</span>` : ''}</span>
+      <span class="title">${esc(i.title)}</span>
+      <div class="reason">${esc(i.reason)}</div>${i.state === '自分の番' ? `<div class="next">次: ${esc(i.next)}</div>` : ''}
+      ${chips.length ? `<span class="chips">${chips.map(c => `<span class="chip">${esc(c)}</span>`).join('')}</span>` : ''}
+    </${tag}>`;
+  }
+
+  function render() {
+    $('repo').textContent = data.repo || '';
+    $('board').innerHTML = data.states.map(s => {
+      const rows = data.worktrees.filter(i => i.state === s);
+      return `<section class="col ${CLS[s] || ''}" aria-label="${esc(s)} ${rows.length} 件">
+        <h2>${esc(s)}<span class="count">${rows.length}</span></h2>
+        ${rows.length ? `<div class="list">${rows.map(card).join('')}</div>` : '<p class="none">なし</p>'}</section>`;
+    }).join('');
+    const mine = data.worktrees.filter(i => i.state === '自分の番').length;
+    document.title = `${mine ? `(${mine}) ` : ''}worktree board`;
+    const stale = !data.updated_at || Date.now() - Date.parse(data.updated_at) > STALE_MIN * 60000;
+    $('stamp').textContent = data.updated_at ? `${hhmm(data.updated_at)} 更新${stale ? `（${STALE_MIN} 分以上更新されていない）` : ''}` : 'まだ見直していない';
+    $('stamp').classList.toggle('stale', stale);
+    showAlert(data.error);
+    const busy = refreshing || data.checking;
+    $('refresh').disabled = busy;
+    $('refresh').textContent = busy ? '見直し中…' : '今すぐ見直す';
+  }
+
+  function showAlert(text) {
+    $('alert').hidden = !text;
+    $('alert').textContent = text || '';
+  }
+
+  async function load() {
+    try {
+      const r = await fetch('/api/worktrees', {cache: 'no-store'});
+      if (!r.ok) throw new Error();
+      data = await r.json();
+    } catch {
+      showAlert('サーバーに届かない。`python3 -m worktree_board serve` が動いているか確かめる');
+      $('stamp').classList.add('stale');
+      return;
+    }
+    render();
+  }
+
+  $('refresh').addEventListener('click', async () => {
+    const before = data?.updated_at, started = Date.now();
+    refreshing = true;
+    $('refresh').disabled = true;
+    $('refresh').textContent = '見直し中…';
+    try { await fetch('/api/refresh', {method: 'POST', headers: {'X-Dashboard': '1'}}); } catch { showAlert('見直しを頼めなかった'); }
+    const poll = async () => {
+      await load();
+      if ((data?.updated_at !== before && !data?.checking) || Date.now() - started > 120000) {
+        refreshing = false;
+        if (data) render();
+      } else setTimeout(poll, 2000);
+    };
+    setTimeout(poll, 1500);
+  });
+
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') load(); });
+  load();
+  setInterval(() => { if (document.visibilityState === 'visible') load(); }, 30000);
+})();
+</script>
+</body>
+</html>
