@@ -3,13 +3,14 @@
 状態は上から順に当てはめて決める（先に当たった規則が勝つ）。
   自分でしか動かせないもの（コンフリクト・CI の失敗・変更の要求）を先に、
   自動で進むもの（CI の実行中）を次に、そのあとに人を待つもの（Draft・レビュー）を見る。
+文章は持たない。理由・次にすること・印は翻訳のキー（locales/*.json）と引数で返し、画面と CLI が自分の言語に直す。
 """
 from __future__ import annotations
 
 import re
 from pathlib import Path
 
-STATES = ["自分の番", "GitHub 待ち", "レビュー待ち", "完了"]
+STATES = ["mine", "github", "review", "done"]  # 画面の列の順
 FAILED = {"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED", "ERROR"}
 
 
@@ -79,46 +80,45 @@ def settle(prs: list[dict], memory: dict[int, str]) -> list[dict]:
     return out
 
 
-def turn(state: str, reason: str, next_step: str = "") -> dict:
-    return {"state": state, "reason": reason, "next": next_step}
+def turn(state: str, reason: str, next_step: str, **args) -> dict:
+    """判定の結果。reason は {key, args}、next は翻訳のキー。"""
+    return {"state": state, "reason": {"key": f"reason.{reason}", "args": args}, "next": f"next.{next_step}"}
 
 
 def judge(pr: dict | None, closed: dict | None, me: str) -> dict:
     """1 つの worktree の状態。pr は開いている PR、closed は同じブランチの閉じた PR（どちらも無ければ PR がまだ無い）。"""
     if pr is None and closed:
-        merged = closed.get("state") == "MERGED"
-        return turn("完了", f"PR #{closed['number']} が" + ("マージされた" if merged else "マージされずにクローズされた"),
-                    "worktree を片付ける")
+        return turn("done", "merged" if closed.get("state") == "MERGED" else "closed", "cleanup", n=closed["number"])
     if pr is None:
-        return turn("自分の番", "PR がまだ無い", "作業を進めるか、PR を作る")
+        return turn("mine", "no_pr", "start")
     if pr.get("mergeable") == "CONFLICTING":
-        return turn("自分の番", "ベースブランチとコンフリクトしている", "ベースブランチを取り込んで解く")
+        return turn("mine", "conflict", "resolve")
     failed = failed_checks(pr)
     if failed:
-        return turn("自分の番", "CI が失敗: " + "、".join(failed[:2]), "ログを見て直し、push する")
+        return turn("mine", "ci_failed", "fix_push", checks=failed[:2])
     asked, pushed = change_requests(pr, me)
     if asked:
-        return turn("自分の番", f"{'、'.join(asked)} が変更を求めた", "指摘を直して push する")
+        return turn("mine", "changes_requested", "address", who=asked)
     running = running_checks(pr)
     if running:
-        return turn("GitHub 待ち", "CI が走っている: " + "、".join(running[:2]), "終わるのを待つ")
+        return turn("github", "ci_running", "wait", checks=running[:2])
     if pr.get("isDraft"):
-        return turn("自分の番", "Draft のまま", "Ready にする")
+        return turn("mine", "draft", "ready")
     if pushed:
-        return turn("レビュー待ち", f"{'、'.join(pushed)} の再レビュー待ち", "待つ")
+        return turn("review", "rereview", "wait", who=pushed)
     if any(r.get("state") == "APPROVED" for r in reviewers(pr, me).values()):
-        return turn("自分の番", "承認された", "マージする")
-    return turn("レビュー待ち", "レビュー待ち", "待つ")
+        return turn("mine", "approved", "merge")
+    return turn("review", "review_waiting", "wait")
 
 
 def badges(pr: dict | None, closed: dict | None, path: str | None) -> list[str]:
     out = []
     if pr and pr.get("isDraft"):
-        out.append("Draft")
+        out.append("badge.draft")
     if not pr and not closed:
-        out.append("PR なし")
+        out.append("badge.no_pr")
     if not path:
-        out.append("worktree なし")
+        out.append("badge.no_worktree")
     return out
 
 

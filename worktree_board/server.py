@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from . import i18n
 from .judge import STATES, build_items, settle
 from .sources import FetchError
 
@@ -26,7 +27,7 @@ class Board:
         self.wake = threading.Event()
         self.items: list[dict] = []
         self.updated_at: str | None = None
-        self.error: str | None = None
+        self.error: dict | None = None  # {key, args}。文章にするのは画面と CLI
         self.checking = False
         self.mergeable: dict[int, str] = {}
 
@@ -35,8 +36,12 @@ class Board:
         try:
             got = self.source.fetch()
             items = build_items(got["worktrees"], settle(got["prs"], self.mergeable), got["closed"], got["me"])
-        except (FetchError, json.JSONDecodeError, OSError) as e:
-            error = f"取得できなかった: {e}"
+        except FetchError as e:
+            error = e.to_dict()
+        except json.JSONDecodeError:
+            error = {"key": "error.bad_json", "args": {}}
+        except OSError as e:
+            error = {"key": "error.os", "args": {"detail": str(e)}}
         else:
             error = None
         finally:
@@ -83,19 +88,24 @@ class Handler(BaseHTTPRequestHandler):
         # DNS を差し替えて、ほかのサイトの名前のまま届くのを防ぐ
         host = re.sub(r":\d+$", "", self.headers.get("Host", ""))
         if host not in ("localhost", "127.0.0.1"):
-            return self.reply(403, {"error": "localhost 以外の名前では受けない"})
+            return self.reply(403, {"error": "only localhost is accepted"})
         # 独自のヘッダーは、ほかのサイトのページからは付けて送れない（付けると事前確認で止まる）
         if method != "GET" and self.headers.get(WRITE_HEADER) != "1":
-            return self.reply(403, {"error": f"{WRITE_HEADER} ヘッダーが無い"})
+            return self.reply(403, {"error": f"missing {WRITE_HEADER} header"})
         path = urlsplit(self.path).path
         if method == "GET" and path == "/":
             return self.reply(200, DASHBOARD.read_bytes(), "text/html; charset=utf-8")
         if method == "GET" and path == "/api/worktrees":
             return self.reply(200, self.board.view())
+        if method == "GET" and path == "/api/locales":
+            return self.reply(200, i18n.languages())
+        m = re.fullmatch(r"/locales/([A-Za-z-]+)\.json", path)
+        if method == "GET" and m and m.group(1) in i18n.available():  # 一覧にある名前だけ読む（パスをそのまま使わない）
+            return self.reply(200, (i18n.LOCALES / f"{m.group(1)}.json").read_bytes())
         if method == "POST" and path == "/api/refresh":
             self.board.wake.set()
             return self.reply(202, {"checking": True})
-        return self.reply(404, {"error": "無い"})
+        return self.reply(404, {"error": "not found"})
 
     def do_GET(self) -> None:
         self.route("GET")
@@ -104,16 +114,16 @@ class Handler(BaseHTTPRequestHandler):
         self.route("POST")
 
 
-def serve(board: Board, port: int) -> int:
-    """board は、最初の 1 回を見直し済みのもの。"""
+def serve(board: Board, port: int, msgs: dict) -> int:
+    """board は、最初の 1 回を見直し済みのもの。msgs は CLI の言語の翻訳。"""
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     except OSError as e:
-        print(f"ポート {port} を使えない: {e}（--port で別のポートを選ぶ）")
+        print(i18n.fmt(msgs, "cli.port_busy", {"port": port, "detail": e}))
         return 1
     Handler.board = board
     threading.Thread(target=board.loop, args=(False,), daemon=True).start()
-    print(f"Dashboard: http://localhost:{port}（{board.interval} 秒おきに見直す。止めるのは Ctrl-C）", flush=True)
+    print(i18n.fmt(msgs, "cli.serving", {"port": port, "interval": board.interval}), flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

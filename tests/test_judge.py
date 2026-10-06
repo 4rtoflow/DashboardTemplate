@@ -5,6 +5,7 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 
+from worktree_board import i18n
 from worktree_board.judge import STATES, build_items, change_requests, failed_checks, judge, running_checks, settle
 from worktree_board.server import Board, Handler
 from worktree_board.sources import FetchError, parse_worktrees
@@ -31,39 +32,39 @@ class JudgeOrder(unittest.TestCase):
         return judge(p, closed, ME)["state"]
 
     def test_no_pr(self):
-        self.assertEqual(self.state(None), "自分の番")
-        self.assertEqual(self.state(None, {"number": 3, "state": "MERGED"}), "完了")
+        self.assertEqual(self.state(None), "mine")
+        self.assertEqual(self.state(None, {"number": 3, "state": "MERGED"}), "done")
 
     def test_conflict_beats_running_ci(self):
         p = pr(mergeable="CONFLICTING", statusCheckRollup=[run("a", None, 1, "IN_PROGRESS")])
-        self.assertEqual(self.state(p), "自分の番")
+        self.assertEqual(self.state(p), "mine")
 
     def test_failed_ci_beats_running_ci(self):
         p = pr(statusCheckRollup=[run("a", "FAILURE", 1), run("b", None, 2, "IN_PROGRESS")])
-        self.assertEqual(self.state(p), "自分の番")
+        self.assertEqual(self.state(p), "mine")
 
     def test_running_ci_is_github_wait(self):
-        self.assertEqual(self.state(pr(statusCheckRollup=[run("a", None, 1, "IN_PROGRESS")])), "GitHub 待ち")
+        self.assertEqual(self.state(pr(statusCheckRollup=[run("a", None, 1, "IN_PROGRESS")])), "github")
 
     def test_draft_waits_for_ci_first(self):
         # CI が走っている間は、Draft でも GitHub 待ち（終わってから Ready にする）
         p = pr(isDraft=True, statusCheckRollup=[run("a", None, 1, "QUEUED")])
-        self.assertEqual(self.state(p), "GitHub 待ち")
-        self.assertEqual(self.state(pr(isDraft=True)), "自分の番")
+        self.assertEqual(self.state(p), "github")
+        self.assertEqual(self.state(pr(isDraft=True)), "mine")
 
     def test_changes_requested_on_head_is_mine(self):
-        self.assertEqual(self.state(pr(reviews=[review("a", "CHANGES_REQUESTED")])), "自分の番")
+        self.assertEqual(self.state(pr(reviews=[review("a", "CHANGES_REQUESTED")])), "mine")
 
     def test_push_after_change_request_waits_for_review(self):
-        self.assertEqual(self.state(pr(reviews=[review("a", "CHANGES_REQUESTED", oid="old")])), "レビュー待ち")
+        self.assertEqual(self.state(pr(reviews=[review("a", "CHANGES_REQUESTED", oid="old")])), "review")
 
     def test_approved_is_mine_unless_changes_requested(self):
-        self.assertEqual(judge(pr(reviews=[review("a", "APPROVED")]), None, ME)["reason"], "承認された")
+        self.assertEqual(judge(pr(reviews=[review("a", "APPROVED")]), None, ME)["reason"]["key"], "reason.approved")
         both = pr(reviews=[review("a", "APPROVED"), review("b", "CHANGES_REQUESTED")])
-        self.assertEqual(judge(both, None, ME)["reason"], "b が変更を求めた")
+        self.assertEqual(judge(both, None, ME)["reason"], {"key": "reason.changes_requested", "args": {"who": ["b"]}})
 
     def test_default_is_review_wait(self):
-        self.assertEqual(self.state(pr()), "レビュー待ち")
+        self.assertEqual(self.state(pr()), "review")
 
 
 class Checks(unittest.TestCase):
@@ -105,15 +106,15 @@ class Items(unittest.TestCase):
     def test_worktree_without_pr_and_pr_without_worktree(self):
         items = build_items({"wip": "/w/wip", "feat": "/w/feat"}, [pr()], {}, ME)
         by = {i["id"]: i for i in items}
-        self.assertEqual(by["wip"]["badges"], ["PR なし"])
-        self.assertEqual(by["feat"]["state"], "レビュー待ち")
+        self.assertEqual(by["wip"]["badges"], ["badge.no_pr"])
+        self.assertEqual(by["feat"]["state"], "review")
         items = build_items({}, [pr()], {}, ME)
-        self.assertEqual((items[0]["label"], items[0]["badges"]), ("PR #1", ["worktree なし"]))
+        self.assertEqual((items[0]["label"], items[0]["badges"]), ("PR #1", ["badge.no_worktree"]))
 
     def test_closed_pr_only_counts_without_open_pr(self):
         closed = {"feat": {"number": 9, "state": "MERGED", "title": "old", "url": "u9"}}
-        self.assertEqual(build_items({"feat": "/w/feat"}, [], closed, ME)[0]["state"], "完了")
-        self.assertEqual(build_items({"feat": "/w/feat"}, [pr()], closed, ME)[0]["state"], "レビュー待ち")
+        self.assertEqual(build_items({"feat": "/w/feat"}, [], closed, ME)[0]["state"], "done")
+        self.assertEqual(build_items({"feat": "/w/feat"}, [pr()], closed, ME)[0]["state"], "review")
 
     def test_sorted_by_state_then_oldest(self):
         prs = [pr(number=1, headRefName="a", updatedAt="2026-01-03T00:00:00Z"),
@@ -150,11 +151,11 @@ class BoardAndServer(unittest.TestCase):
         board = Board(src)
         board.tick()
         self.assertEqual(len(board.view()["worktrees"]), 1)
-        src.error = FetchError("boom")
+        src.error = FetchError("error.failed", detail="boom")
         board.tick()
         v = board.view()
         self.assertEqual(len(v["worktrees"]), 1)
-        self.assertIn("boom", v["error"])
+        self.assertEqual(v["error"], {"key": "error.failed", "args": {"detail": "boom"}})
 
     def serve(self):
         board = Board(FakeSource({"worktrees": {}, "prs": [pr()], "closed": {}, "me": ME}))
@@ -181,6 +182,11 @@ class BoardAndServer(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(json.loads(body)["worktrees"][0]["pr"], 1)
         self.assertEqual(self.request(port, "/")[0], 200)
+        # 翻訳は、一覧にある言語だけ配る（パスをそのまま開かない）
+        self.assertEqual(self.request(port, "/locales/ja.json")[0], 200)
+        self.assertEqual(self.request(port, "/locales/nope.json")[0], 404)
+        self.assertEqual(self.request(port, "/locales/..%2Fjudge.json")[0], 404)
+        self.assertEqual(len(json.loads(self.request(port, "/api/locales")[1])), len(i18n.available()))
         # ヘッダー無しの書き込みと、localhost 以外の名前の読み取りは断る
         self.assertEqual(self.request(port, "/api/refresh", "POST")[0], 403)
         self.assertEqual(self.request(port, "/api/refresh", "POST", {"X-Dashboard": "1"})[0], 202)

@@ -11,18 +11,25 @@ CLOSED_FIELDS = "number,headRefName,state,title,url,mergedAt,closedAt"
 
 
 class FetchError(Exception):
-    pass
+    """取れなかった理由。文章は持たず、翻訳のキー（error.*）と引数で持つ。"""
+
+    def __init__(self, key: str, **args):
+        super().__init__(key, args)
+        self.key, self.params = key, args  # args は Exception の組み込みの名前で、代入するとタプルに直されてしまう
+
+    def to_dict(self) -> dict:
+        return {"key": self.key, "args": self.params}
 
 
 def run(cmd: list[str], cwd: Path) -> str:
     try:
         r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=120)
     except FileNotFoundError:
-        raise FetchError(f"{cmd[0]} が見つからない（インストールして PATH に通す）") from None
+        raise FetchError("error.command_missing", cmd=cmd[0]) from None
     except subprocess.TimeoutExpired:
-        raise FetchError(f"{' '.join(cmd[:3])} が時間内に終わらなかった") from None
+        raise FetchError("error.timeout", cmd=" ".join(cmd[:3])) from None
     if r.returncode != 0:
-        raise FetchError(r.stderr.strip()[:300] or f"{' '.join(cmd[:3])} が失敗した")
+        raise FetchError("error.failed", detail=r.stderr.strip()[:300] or " ".join(cmd[:3]))
     return r.stdout
 
 
