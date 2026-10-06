@@ -1,4 +1,4 @@
-# worktree-board-lite
+# dashboard-template
 
 自分の git worktree と GitHub の PR を見て、「今ボールを持っているのは誰か」をブラウザの Dashboard に出す小さな道具。
 見るだけで、GitHub への書き込み（コメント・ラベル・マージなど）は一切しない。
@@ -18,7 +18,7 @@
 このリポジトリを clone したフォルダで動かし、見たい repo は `--checkout` で渡す。
 
 ```bash
-cd worktree-board-lite
+cd dashboard-template
 python3 -m worktree_board serve --checkout ~/work/my-repo   # http://localhost:8765 に Dashboard を出す
 python3 -m worktree_board status --checkout ~/work/my-repo   # 今の状態を 1 回だけ端末に出す
 ```
